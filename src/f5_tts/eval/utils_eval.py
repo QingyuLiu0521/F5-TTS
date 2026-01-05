@@ -8,6 +8,10 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
+import pyphen
+
+import unicodedata
+import re
 
 from f5_tts.eval.ecapa_tdnn import ECAPA_TDNN_SMALL
 from f5_tts.model.modules import MelSpec
@@ -54,6 +58,19 @@ def get_librispeech_test_clean_metainfo(metalst, librispeech_test_clean_path):
     return metainfo
 
 
+def get_mytestset_metainfo(metalst, librispeech_test_clean_path):
+    f = open(metalst)
+    lines = f.readlines()
+    f.close()
+    metainfo = []
+    for line in lines:
+        ref_utt, ref_dur, ref_txt, gen_utt, gen_dur, gen_txt = line.strip().split("\t")
+        ref_wav = os.path.join(librispeech_test_clean_path, ref_utt + ".wav")
+        gen_wav = os.path.join(librispeech_test_clean_path, gen_utt + ".wav")
+        metainfo.append((gen_utt, ref_txt, ref_wav, " " + gen_txt, gen_wav))
+    return metainfo
+
+
 # padded to max length mel batch
 def padded_mel_batch(ref_mels):
     max_mel_length = torch.LongTensor([mel.shape[-1] for mel in ref_mels]).amax()
@@ -68,6 +85,61 @@ def padded_mel_batch(ref_mels):
 
 # get prompts from metainfo containing: utt, prompt_text, prompt_wav, gt_text, gt_wav
 
+def clean_sentence(s: str) -> str:
+    out = []
+    
+    for i, ch in enumerate(s):
+        if unicodedata.category(ch).startswith('P'):
+            if ch in ["'", "'"]: 
+                prev_is_letter = i > 0 and s[i-1].isalpha()
+                next_is_letter = i < len(s) - 1 and s[i+1].isalpha()
+                
+                if prev_is_letter and next_is_letter:
+                    out.append(ch)
+        else:
+            out.append(ch)
+    
+    no_punctuation = ''.join(out)
+    
+    return re.sub(r'\s+', ' ', no_punctuation).strip()
+
+def count(text):
+    def count_syllables(text):
+        dic = pyphen.Pyphen(lang='en_US')
+        total_syllables = 0
+        
+        # Define the regular expression
+        #   [a-zA-Z']+  Matches one or more English letters or apostrophes (to handle words like "don't", "haven't")
+        #   [\u4e00-\u9fff] Matches a single Chinese character
+        pattern = re.compile(r"[a-zA-Z']+|[\u4e00-\u9fff]")
+        tokens = pattern.findall(text)
+        
+        for token in tokens:
+            if '\u4e00' <= token <= '\u9fff':
+                total_syllables += 1
+            else:
+                try:
+                    syllables = dic.inserted(token.lower()).split("-")
+                    total_syllables += len(syllables)
+                except Exception:
+                    total_syllables += 1
+                    
+        return total_syllables
+
+    def count_punctuations(text):
+        punct_map = {
+            '.': 1.5, '!': 1.5, '?': 1.5,
+            ',': 0.7, ';': 1.0, ':': 1.0,
+            '。': 1.3, '！': 1.3, '？': 1.3,
+            '，': 0.6, '；': 0.8, '：': 0.8,
+        }
+        punct_syllables = 0
+        for char in text:
+            if char in punct_map:
+                punct_syllables += punct_map[char]
+        return punct_syllables
+    
+    return round(count_syllables(text) + count_punctuations(text))
 
 def get_inference_prompt(
     metainfo,
@@ -86,6 +158,12 @@ def get_inference_prompt(
     num_buckets=200,
     min_secs=3,
     max_secs=40,
+    qwen_tokenizer=None,
+    remove_punctuations=True,
+    droptext=False,
+    reverse=False,
+    model_sp=None,
+    device=None,
 ):
     prompts_all = []
 
@@ -117,12 +195,25 @@ def get_inference_prompt(
             resampler = torchaudio.transforms.Resample(ref_sr, target_sample_rate)
             ref_audio = resampler(ref_audio)
 
+        if remove_punctuations == True:
+            prompt_text = clean_sentence(prompt_text)
+            gt_text = clean_sentence(gt_text)
+
         # Text
         if len(prompt_text[-1].encode("utf-8")) == 1:
             prompt_text = prompt_text + " "
-        text = [prompt_text + gt_text]
+
+        if droptext:
+            text = [gt_text]
+        elif reverse:
+            gt_text = gt_text + " "
+            text = [gt_text + prompt_text]
+        else:
+            text = [prompt_text + gt_text]
         if tokenizer == "pinyin":
             text_list = convert_char_to_pinyin(text, polyphone=polyphone)
+        elif tokenizer == "bpe":
+            text_list = [qwen_tokenizer.encode(prompt_text, add_special_tokens=False) + qwen_tokenizer.encode(" ", add_special_tokens=False) + qwen_tokenizer.encode(gt_text, add_special_tokens=False)]
         else:
             text_list = text
 
@@ -143,9 +234,23 @@ def get_inference_prompt(
             # # test vocoder resynthesis
             # ref_audio = gt_audio
         else:
-            ref_text_len = len(prompt_text.encode("utf-8"))
-            gen_text_len = len(gt_text.encode("utf-8"))
-            total_mel_len = ref_mel_len + int(ref_mel_len / ref_text_len * gen_text_len / speed)
+            if model_sp is not None:
+                gt_num_unit = count(gt_text)
+                ref_mel_t = ref_mel.unsqueeze(0).permute(0, 2, 1)
+                ref_mel_tensor = ref_mel_t.to(device)
+                ref_mel_len_tensor = torch.tensor([ref_mel_len], dtype=torch.long).to(device)
+                speed = model_sp.predict_speed(
+                    audio=ref_mel_tensor,
+                    lens=ref_mel_len_tensor,
+                )
+                # pred_duration = gt_num_unit / speed.item()
+                pred_duration = min(max(gt_num_unit / speed.item(), 2), 30)
+                gen_mel_len = int((pred_duration * target_sample_rate) / hop_length)
+                total_mel_len = ref_mel_len + gen_mel_len
+            else:
+                ref_text_len = len(prompt_text.encode("utf-8"))
+                gen_text_len = len(gt_text.encode("utf-8"))
+                total_mel_len = ref_mel_len + int(ref_mel_len / ref_text_len * gen_text_len / speed)
 
         # deal with batch
         assert infer_batch_size > 0, "infer_batch_size should be greater than 0."
@@ -203,6 +308,158 @@ def get_inference_prompt(
     random.shuffle(prompts_all)
 
     return prompts_all
+
+# def get_inference_prompt(
+#     metainfo,
+#     speed=1.0,
+#     tokenizer="pinyin",
+#     polyphone=True,
+#     target_sample_rate=24000,
+#     n_fft=1024,
+#     win_length=1024,
+#     n_mel_channels=100,
+#     hop_length=256,
+#     mel_spec_type="vocos",
+#     target_rms=0.1,
+#     use_truth_duration=False,
+#     infer_batch_size=1,
+#     num_buckets=200,
+#     min_secs=3,
+#     max_secs=40,
+#     qwen_tokenizer=None,
+#     remove_punctuations=True,
+#     droptext=False,
+#     reverse=False,
+# ):
+#     prompts_all = []
+
+#     min_tokens = min_secs * target_sample_rate // hop_length
+#     max_tokens = max_secs * target_sample_rate // hop_length
+
+#     batch_accum = [0] * num_buckets
+#     utts, ref_rms_list, ref_mels, ref_mel_lens, total_mel_lens, final_text_list = (
+#         [[] for _ in range(num_buckets)] for _ in range(6)
+#     )
+
+#     mel_spectrogram = MelSpec(
+#         n_fft=n_fft,
+#         hop_length=hop_length,
+#         win_length=win_length,
+#         n_mel_channels=n_mel_channels,
+#         target_sample_rate=target_sample_rate,
+#         mel_spec_type=mel_spec_type,
+#     )
+
+#     for utt, prompt_text, prompt_wav, gt_text, gt_wav in tqdm(metainfo, desc="Processing prompts..."):
+#         # Audio
+#         ref_audio, ref_sr = torchaudio.load(prompt_wav)
+#         ref_rms = torch.sqrt(torch.mean(torch.square(ref_audio)))
+#         if ref_rms < target_rms:
+#             ref_audio = ref_audio * target_rms / ref_rms
+#         assert ref_audio.shape[-1] > 5000, f"Empty prompt wav: {prompt_wav}, or torchaudio backend issue."
+#         if ref_sr != target_sample_rate:
+#             resampler = torchaudio.transforms.Resample(ref_sr, target_sample_rate)
+#             ref_audio = resampler(ref_audio)
+
+#         if remove_punctuations == True:
+#             prompt_text = clean_sentence(prompt_text)
+#             gt_text = clean_sentence(gt_text)
+
+#         # Text
+#         if len(prompt_text[-1].encode("utf-8")) == 1:
+#             prompt_text = prompt_text + " "
+
+#         if droptext:
+#             text = [gt_text]
+#         elif reverse:
+#             gt_text = gt_text + " "
+#             text = [gt_text + prompt_text]
+#         else:
+#             text = [prompt_text + gt_text]
+#         if tokenizer == "pinyin":
+#             text_list = convert_char_to_pinyin(text, polyphone=polyphone)
+#         elif tokenizer == "bpe":
+#             text_list = [qwen_tokenizer.encode(prompt_text, add_special_tokens=False) + qwen_tokenizer.encode(" ", add_special_tokens=False) + qwen_tokenizer.encode(gt_text, add_special_tokens=False)]
+#         else:
+#             text_list = text
+
+#         # to mel spectrogram
+#         ref_mel = mel_spectrogram(ref_audio)
+#         ref_mel = ref_mel.squeeze(0)
+
+#         # Duration, mel frame length
+#         ref_mel_len = ref_mel.shape[-1]
+
+#         if use_truth_duration:
+#             gt_audio, gt_sr = torchaudio.load(gt_wav)
+#             if gt_sr != target_sample_rate:
+#                 resampler = torchaudio.transforms.Resample(gt_sr, target_sample_rate)
+#                 gt_audio = resampler(gt_audio)
+#             total_mel_len = ref_mel_len + int(gt_audio.shape[-1] / hop_length / speed)
+
+#             # # test vocoder resynthesis
+#             # ref_audio = gt_audio
+#         else:
+#             ref_text_len = len(prompt_text.encode("utf-8"))
+#             gen_text_len = len(gt_text.encode("utf-8"))
+#             total_mel_len = ref_mel_len + int(ref_mel_len / ref_text_len * gen_text_len / speed)
+
+#         # deal with batch
+#         assert infer_batch_size > 0, "infer_batch_size should be greater than 0."
+#         assert min_tokens <= total_mel_len <= max_tokens, (
+#             f"Audio {utt} has duration {total_mel_len * hop_length // target_sample_rate}s out of range [{min_secs}, {max_secs}]."
+#         )
+#         bucket_i = math.floor((total_mel_len - min_tokens) / (max_tokens - min_tokens + 1) * num_buckets)
+
+#         utts[bucket_i].append(utt)
+#         ref_rms_list[bucket_i].append(ref_rms)
+#         ref_mels[bucket_i].append(ref_mel)
+#         ref_mel_lens[bucket_i].append(ref_mel_len)
+#         total_mel_lens[bucket_i].append(total_mel_len)
+#         final_text_list[bucket_i].extend(text_list)
+
+#         batch_accum[bucket_i] += total_mel_len
+
+#         if batch_accum[bucket_i] >= infer_batch_size:
+#             # print(f"\n{len(ref_mels[bucket_i][0][0])}\n{ref_mel_lens[bucket_i]}\n{total_mel_lens[bucket_i]}")
+#             prompts_all.append(
+#                 (
+#                     utts[bucket_i],
+#                     ref_rms_list[bucket_i],
+#                     padded_mel_batch(ref_mels[bucket_i]),
+#                     ref_mel_lens[bucket_i],
+#                     total_mel_lens[bucket_i],
+#                     final_text_list[bucket_i],
+#                 )
+#             )
+#             batch_accum[bucket_i] = 0
+#             (
+#                 utts[bucket_i],
+#                 ref_rms_list[bucket_i],
+#                 ref_mels[bucket_i],
+#                 ref_mel_lens[bucket_i],
+#                 total_mel_lens[bucket_i],
+#                 final_text_list[bucket_i],
+#             ) = [], [], [], [], [], []
+
+#     # add residual
+#     for bucket_i, bucket_frames in enumerate(batch_accum):
+#         if bucket_frames > 0:
+#             prompts_all.append(
+#                 (
+#                     utts[bucket_i],
+#                     ref_rms_list[bucket_i],
+#                     padded_mel_batch(ref_mels[bucket_i]),
+#                     ref_mel_lens[bucket_i],
+#                     total_mel_lens[bucket_i],
+#                     final_text_list[bucket_i],
+#                 )
+#             )
+#     # not only leave easy work for last workers
+#     random.seed(666)
+#     random.shuffle(prompts_all)
+
+#     return prompts_all
 
 
 # get wav_res_ref_text of seed-tts test metalst
